@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 from scipy.interpolate import splprep, splev
 import pandas as pd
-
+from ekf_slam import *
 
 class Car:
     def __init__(self, x, y, angle = 0, length = 2, max_steering = 80, max_acceleration = 4.0):
@@ -23,6 +23,7 @@ class Car:
 
         self.acceleration = 0.0
         self.steering = 0.0
+        self.angular_velocity = 0
         self.fov = 175 #150
         self.turning_sharpness = 1.8
         self.breaks = True
@@ -36,15 +37,14 @@ class Car:
 
         if self.steering:
             turning_radius = self.length / sin(radians(self.steering))
-            angular_velocity = self.velocity.x / turning_radius
+            self.angular_velocity = self.velocity.x / turning_radius
         else:
-            angular_velocity = 0
+            self.angular_velocity = 0
 
         self.position += self.velocity.rotate(-self.angle) * dt
-        self.angle += degrees(angular_velocity) * dt
+        self.angle += degrees(self.angular_velocity) * dt
         
-        
-        
+
 class Target:
     def __init__(self, x, y):
         self.position = Vector2(x, y)
@@ -52,8 +52,7 @@ class Target:
         self.dist_car = 10**10
         self.alpha = 0
         self.visible = False
-        
-        
+
     def update(self, car, time_running, ppu, car_angle): 
         
         #distance to car
@@ -147,9 +146,6 @@ class PathPlanning:
         image_path = os.path.join(current_dir, "car_r_30.png")
         car_image = pygame.image.load(image_path)
         
-        image_path7 = os.path.join(current_dir, "explosion_image.png")
-        explosion_image = pygame.image.load(image_path7)
-        
         image_path1 = os.path.join(current_dir, "target_r_t.png")
         target_image = pygame.image.load(image_path1)
         
@@ -168,7 +164,7 @@ class PathPlanning:
         image_path6 = os.path.join(current_dir, "right_spline_s.png")
         right_spline_image = pygame.image.load(image_path6)
 
-        car = Car(15,3)
+        car = Car(15, 3)
 
         ppu = 32
         time_start = time.time()
@@ -199,22 +195,54 @@ class PathPlanning:
         left_spline_linked = False
         fullscreen = False
         track_number = 0
-        cruising_speed = 2
+        cruising_speed = 2.5
         cone_connect_list = False
         first_right_cone_found = False
         first_left_cone_found = False
         midpoint_created = False
         track_number_changed = False
-        car_crashed = False
-        start_time_set = False
-        
+        # activate slam
+        slam = False
+        # ------------------------------------------------------|
+        #                       SLAM: START                     |
+        # ------------------------------------------------------|
+        # not sure if needed
+        landmarks_left = np.array((0, 0))
+        landmarks_right = np.array((0, 0))
+        landmarks = np.vstack((landmarks_left, landmarks_right))
+
+        # State Vector [x y yaw]'
+        xEst = np.vstack((car.position.x, car.position.y, car.angle))
+        xTrue = np.vstack((car.position.x, car.position.y, car.angle))
+        PEst = np.eye(STATE_SIZE)
+        x_state = xEst
+        xDR = np.vstack((car.position.x, car.position.y, car.angle))  # Dead reckoning
+
+        # history
+        hxEst = xEst
+        hxTrue = xTrue
+        hxDR = xTrue
+        # cones used in SLAM later
+        left_cones_slam = []
+        right_cones_slam = []
+        visible_left_cones_slam = []
+        visible_right_cones_slam = []
+
+        # if we use all true cone positions every step, make sure landmarks is only initialized once
+        # reduntant once the visable cone thing works
+        slam_landmark_maker = True
+
+        # ------------------------------------------------------|
+        #                       SLAM: END                       |
+        # ------------------------------------------------------|
+
         def draw_line_dashed(surface, color, start_pos, end_pos, width = 1, dash_length = 10, exclude_corners = True):
 
             'simply a function that draws dashed lines in pygame'    
         
             # convert tuples to numpy arrays
             start_pos = np.array(start_pos)
-            end_pos   = np.array(end_pos)
+            end_pos = np.array(end_pos)
         
             # get euclidian distance between start_pos and end_pos
             length = np.linalg.norm(end_pos - start_pos)
@@ -227,8 +255,7 @@ class PathPlanning:
         
             return [pygame.draw.line(surface, color, tuple(dash_knots[n]), tuple(dash_knots[n+1]), width)
                     for n in range(int(exclude_corners), dash_amount - int(exclude_corners), 2)]    
-        
-        
+
         def save_map(left_cones, right_cones):
             cone_x = []
             cone_y = []
@@ -259,11 +286,7 @@ class PathPlanning:
                                          'Cone_Y' : cone_y})
         
             map_file.to_csv(f'{name}.csv')
-        
-        
-        
-        
-        
+
         def load_map(mouse_pos_list):
             
             left_cones = []
@@ -284,20 +307,10 @@ class PathPlanning:
                 else:
                     right_cone = Cone(map_file['Cone_X'].iloc[i],map_file['Cone_Y'].iloc[i], 'right')
                     right_cones.append(right_cone)
-                    mouse_pos_list.append((map_file['Cone_X'].iloc[i]*ppu,map_file['Cone_Y'].iloc[i]*ppu))             
-                
-            
+                    mouse_pos_list.append((map_file['Cone_X'].iloc[i]*ppu,map_file['Cone_Y'].iloc[i]*ppu))
             return left_cones, right_cones, mouse_pos_list
-        
-        
 
-        
         while not self.exit:
-            
-            
-            if start_time_set == False:
-                time_start_sim = time.time()
-                start_time_set = True
             
             dt = self.clock.get_time() / 500
 
@@ -314,25 +327,25 @@ class PathPlanning:
             
             
             #If t pressed then create target
-            if  0 == 1: #pressed[pygame.K_t]        DISABLING THIS FUNCTIONALITY FOR NOW
-                    mouse_pos = pygame.mouse.get_pos()
-                    
-                    if mouse_pos in mouse_pos_list:
-                        continue
-                    else:
-                        make_target = True
-                        for i in range(len(mouse_pos_list)):
-                            if np.linalg.norm(tuple(x-y for x,y in zip(mouse_pos_list[i],mouse_pos))) < 25:
-                                make_target = False
-                                break
-                        
-                        if make_target == True:
-                            
-                            target = Target(mouse_pos[0]/ppu,mouse_pos[1]/ppu)
-                            targets.append(target)
-                            non_passed_targets.append(target)
-                            
-                            mouse_pos_list.append(mouse_pos)
+            if 0 == 1: #pressed[pygame.K_t]        DISABLING THIS FUNCTIONALITY FOR NOW
+                mouse_pos = pygame.mouse.get_pos()
+
+                if mouse_pos in mouse_pos_list:
+                    continue
+                else:
+                    make_target = True
+                    for i in range(len(mouse_pos_list)):
+                        if np.linalg.norm(tuple(x-y for x,y in zip(mouse_pos_list[i],mouse_pos))) < 25:
+                            make_target = False
+                            break
+
+                    if make_target == True:
+
+                        target = Target(mouse_pos[0]/ppu,mouse_pos[1]/ppu)
+                        targets.append(target)
+                        non_passed_targets.append(target)
+
+                        mouse_pos_list.append(mouse_pos)
                         
                         
             # press l for left cone
@@ -352,10 +365,9 @@ class PathPlanning:
                     if make_cone == True:
                         left_cone = Cone(mouse_pos[0]/ppu, mouse_pos[1]/ppu, 'left')
                         left_cones.append(left_cone)
+                        landmarks_left = np.vstack((landmarks_left, np.array([left_cone.position.x, left_cone.position.y])))
                         mouse_pos_list.append(mouse_pos)
-                        
-                        
-                    
+
             # press r for right cone
             if pressed[pygame.K_r]:
                 mouse_pos = pygame.mouse.get_pos()
@@ -373,9 +385,10 @@ class PathPlanning:
                     if make_cone == True:
                         right_cone = Cone(mouse_pos[0]/ppu, mouse_pos[1]/ppu, 'right')
                         right_cones.append(right_cone)
+                        landmarks_right = np.vstack((landmarks_right, np.array([right_cone.position.x, right_cone.position.y])))
                         mouse_pos_list.append(mouse_pos)
-            
-            
+
+
             
             #if CTRL + c then clear screen
             if pressed[pygame.K_LCTRL] and pressed[pygame.K_c]:
@@ -401,9 +414,7 @@ class PathPlanning:
                 first_right_cone_found = False
                 first_left_cone_found = False
                 track_number_changed = False
-                car_crashed = False
-                
-                
+
             #if 2 is pressed, increasing cruising speed
             #if 1 is pressed, decrease cruising speed
             
@@ -412,15 +423,12 @@ class PathPlanning:
                     cruising_speed -= 0.05
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_2:
                     cruising_speed += 0.05
-            
-                
-                
+
             #if a pressed then toggle automatic driving
             for event in events:
                 if event.type == pygame.KEYUP and event.key == pygame.K_a: 
                     if car.auto == False:
                         car.auto  = True
-                        time_start_track = time.time()
                     else:
                         car.auto  = False
                         
@@ -431,8 +439,7 @@ class PathPlanning:
                         fullscreen  = True
                     else:
                         fullscreen  = False
-                        
-            
+
             #if h pressed then toggle headlight
             for event in events:
                 if event.type == pygame.KEYUP and event.key == pygame.K_h:
@@ -440,8 +447,7 @@ class PathPlanning:
                         car.headlights = True
                     else:
                         car.headlights = False
-                
-                
+
             #if t pressed then set to track mode
             for event in events:
                 if event.type == pygame.KEYUP and event.key == pygame.K_t: 
@@ -449,15 +455,22 @@ class PathPlanning:
                         track = True
                     else:
                         track = False
-                        
-                        
+
+            # if t pressed then set to track mode
+            for event in events:
+                if event.type == pygame.KEYUP and event.key == pygame.K_e:
+                    if slam == False:
+                        slam = True
+                    else:
+                        slam = False
+
             #if S then save map
             if  pressed[pygame.K_s]:
                 save_map(left_cones, right_cones)
                 
                 
             #if D then load map
-            if  pressed[pygame.K_d]:
+            if pressed[pygame.K_d]:
                 
                 #resetting most vars before loading
                 targets  = []
@@ -481,12 +494,10 @@ class PathPlanning:
                 first_right_cone_found = False
                 first_left_cone_found = False
                 track_number_changed = False
-                car_crashed = False
                 
                 
                 left_cones, right_cones, mouse_pos_list = load_map(mouse_pos_list)
-                
-                    
+
             #manual acceleration
             if pressed[pygame.K_UP]:
                 if car.velocity.x < 0:
@@ -512,9 +523,7 @@ class PathPlanning:
                         
 
             time_running = time.time() - time_start
-            
-            
-            
+
             #redefining the car angle so that it is in (-180,180)
             temp_sign = np.mod(car.angle,360)
             if temp_sign > 180:
@@ -534,7 +543,6 @@ class PathPlanning:
             visible_targets = []
             visible_dists = []
 
-            
             #make list of visible targets and list of passed targets
             for target in targets:
                 
@@ -565,9 +573,7 @@ class PathPlanning:
             #tracking the number of cones at each iteration and creating a flag for when a new cone is detected
             len_visible_left_cones_new = len(visible_left_cones)
             new_visible_left_cone_flag = len_visible_left_cones_new != len_visible_left_cones_old
-            
-            
-            
+
             #make list of visible right cones
             len_visible_right_cones_old = len(visible_right_cones)
             
@@ -579,8 +585,7 @@ class PathPlanning:
             #tracking the number of cones at each iteration and creating a flag for when a new cone is detected
             len_visible_right_cones_new = len(visible_right_cones)
             new_visible_right_cone_flag = len_visible_right_cones_new != len_visible_right_cones_old
-                    
-            
+
             #define closest target
             if len(visible_targets) > 0:
                 if len(visible_dists) == 0:
@@ -634,6 +639,8 @@ class PathPlanning:
             
             
             #cubic splines for left track boundaries
+            
+            
             if len(visible_left_cones) > 1 and car.auto == True and new_visible_left_cone_flag == True:
               
                 if first_left_cone_found == False:
@@ -784,7 +791,11 @@ class PathPlanning:
                 else:
                     path_midpoints_spline = []
                     
-
+                    
+                #maybe right a function that filters the spline so that they are an appropraite distance
+                
+                #then a function that creates targets,
+                #and when passed they cant be updated
                 if len(path_midpoints_spline) > 0:
                     for i in range(len(path_midpoints_spline[0])):
                         new_target_loc = [path_midpoints_spline[0][i], path_midpoints_spline[1][i]]
@@ -804,56 +815,20 @@ class PathPlanning:
                                 target_locations.append(new_target_loc)
                  
                     
-            #Setting the finishing line/point
             if first_visible_left_cone != 0 and first_visible_right_cone != 0 and midpoint_created == False:     
                 start_midpoint_x = np.mean([first_visible_left_cone.position.x,first_visible_right_cone.position.x])
                 start_midpoint_y = np.mean([first_visible_left_cone.position.y,first_visible_right_cone.position.y])     
                 midpoint_created = True
                 
-            #if the track number = 3, exit
-            if first_visible_left_cone != 0 and first_visible_right_cone != 0 and np.linalg.norm((start_midpoint_x, start_midpoint_y)-car.position) < 20/ppu and track_number_changed == False and track_number == 3:
-                print('FINISHED!', 'TIME : ', time.time() - time_start_track)
-                self.exit = True
-                track_number_changed = True    
-                
-            #if car passes finishing line, add 1 to track number
-            elif first_visible_left_cone != 0 and first_visible_right_cone != 0 and np.linalg.norm((start_midpoint_x, start_midpoint_y)-car.position) < 20/ppu and track_number_changed == False:
+            if first_visible_left_cone != 0 and first_visible_right_cone != 0 and np.linalg.norm((start_midpoint_x, start_midpoint_y)-car.position) < 20/ppu and track_number_changed == False:
                 track_number += 1
-                print('TIME : ', time.time() - time_start_track)
                 track_number_changed = True
                 
-            #setting track_number_changed to false when not on finishing line
             elif first_visible_left_cone != 0 and first_visible_right_cone != 0 and np.linalg.norm((start_midpoint_x, start_midpoint_y)-car.position) > 20/ppu:
                 track_number_changed = False
-
-
-
-            # Car crash mechanic
-            if len(left_cones) > 0 or len(right_cones):
-                car_crashed = False
                 
-                #checking left cones for crash
-                for i in range(len(left_cones)):
-                    if np.linalg.norm(tuple(x-y for x,y in zip([car.position.x, car.position.y], [left_cones[i].position.x, left_cones[i].position.y]))) < 0.5:
-                        car_crashed = True
-                        break
-                    
-                #crashing right cones
-                if car_crashed == False:
-                    for i in range(len(right_cones)):
-                        if np.linalg.norm(tuple(x-y for x,y in zip([car.position.x, car.position.y], [right_cones[i].position.x, right_cones[i].position.y]))) < 0.5:
-                            car_crashed = True
-                            break
-                        
-                       
-                if car_crashed == True:
-                    print('CAR CRASHED!!')
-                    print('TIME : ', time.time() - time_start_sim)
-                    self.exit = True
-                    #change car image to explosion 
-                
-                
-                    
+                  #if close to this co-ordinate, add lap to track, but only once
+
             # Logic
             car.update(dt)
             
@@ -865,10 +840,55 @@ class PathPlanning:
                 
             for right_cone in right_cones:
                 right_cone.update(car, time_running, ppu, car_angle)
-            
+
+            # ------------------------------------------------------|
+            #                       SLAM: START                     |
+            # ------------------------------------------------------|
+
+            # if we use all landmarks initally, reduntant if visable cones work
+            if slam and slam_landmark_maker:
+                for cone in right_cones:
+                    right_cones_slam.append([cone.position.x, cone.position.y])
+                for cone in left_cones:
+                    left_cones_slam.append([cone.position.x, cone.position.y])
+                landmarks = np.vstack((left_cones_slam, right_cones_slam))
+                slam_landmark_maker = False
+            # TODO
+            # if E is pressed do SLAM at every step
+            if slam:
+                print(dt)
+                # get list of visual cones, atm it is all cones that the car saw so far
+                # change so that this is only the cones in headlight atm
+                visible_right_cones_slam = []
+                visible_left_cones_slam = []
+                for cone in visible_right_cones:
+                    visible_right_cones_slam.append([cone.position.x, cone.position.y])
+                for cone in visible_left_cones:
+                    visible_left_cones_slam.append([cone.position.x, cone.position.y])
+                landmarks = np.vstack((visible_left_cones_slam, visible_right_cones_slam))
+                print(len(visible_right_cones_slam))
+                # control params in EACH iteration: linear and angular velocity
+                linear_velocity = get_linear_velocity(car.velocity.x, car.velocity.y)  # [m/s]
+                # has to be negative for some reason
+                angular_velocity = -car.angular_velocity  # [rad/s]
+                U = np.array([[linear_velocity, angular_velocity]]).T
+
+                # Check for update in car position; control update function
+                xTrue, gps_noise, xDR, ud = observation(xTrue, xDR, U, landmarks, dt)
+                xEst, PEst = ekf_slam(xEst, PEst, ud, gps_noise, dt)
+                
+                x_state = xEst[0:STATE_SIZE]
+                # store data history
+                hxEst = np.hstack((hxEst, x_state))
+                hxDR = np.hstack((hxDR, xDR))
+                hxTrue = np.hstack((hxTrue, xTrue))
+
+            # ------------------------------------------------------|
+            #                      SLAM: END                        |
+            # ------------------------------------------------------|
 
             # Drawing
-        
+
             self.screen.fill((0, 0, 0))
             rotated = pygame.transform.rotate(car_image, car.angle)
             rect = rotated.get_rect()
@@ -916,18 +936,15 @@ class PathPlanning:
                     if target.visible == True and car.auto == True:
                         pass
                         draw_line_dashed(self.screen, (150,150,150),(pos_1,pos_2) , target.position * ppu , width = 1, dash_length = 10, exclude_corners = True)
-              
-            
+
             if len(left_cones) > 0:
                 for left_cone in left_cones:
                     self.screen.blit(left_cone_image, left_cone.position * ppu - (3,3))
 
-
             if len(right_cones) > 0:
                 for right_cone in right_cones:
                     self.screen.blit(right_cone_image, right_cone.position * ppu - (3,3))
-                    
-                    
+
             if left_spline != 0 and len(left_spline) > 0:
                 for i in range(len(left_spline[0])):
                     self.screen.blit(left_spline_image, Vector2(left_spline[0][i],left_spline[1][i]) * ppu - (3,3))
@@ -936,12 +953,16 @@ class PathPlanning:
              #   print(f'right spline : {right_spline}')
                 for i in range(len(right_spline[0])):
                     self.screen.blit(right_spline_image, Vector2(right_spline[0][i],right_spline[1][i]) * ppu - (3,3))
-            
-            
+
             if first_visible_left_cone != 0 and first_visible_right_cone != 0:
                 draw_line_dashed(self.screen, (255, 51, 0),(first_visible_left_cone.position.x* ppu ,first_visible_left_cone.position.y* ppu) , (first_visible_right_cone.position.x* ppu ,first_visible_right_cone.position.y* ppu) , width = 2, dash_length = 5, exclude_corners = True)
-            
-            
+            if slam:
+                pygame.draw.circle(self.screen, (200, 150, 150), (round(float(x_state[0]), 2) * ppu, round(float(x_state[1]), 2)*ppu), 5, 5)
+                # self.screen.blit(rotated, (round(float(x_state[0]), 2))
+                pygame.draw.circle(self.screen, (200, 150, 150),
+                                (round(float(x_state[0]), 2) * ppu, round(float(x_state[1]), 2) * ppu), 5, 5)
+                tuple([round(float(x), 2)*ppu for x in x_state[0:2]])
+            self.screen.blit(rotated, car.position * ppu - ((rect.width / 2), (rect.height / 2)))  # draw car
             
            # if path_midpoints != 0 and len(path_midpoints) > 0:
              #  print(f'midpoints : {path_midpoints}')
@@ -956,10 +977,7 @@ class PathPlanning:
             
             # draw the car sprite
             #pygame.draw.rect(self.screen, (200,200,200), (car.position * ppu - ((rect.width / 2),(rect.height / 2)), (rect.width, rect.height))) #draws a little box around the car sprite (just for debug)
-            if car_crashed == False:
-                self.screen.blit(rotated, car.position * ppu - ((rect.width / 2),(rect.height / 2))) #draw car
-            else:
-                self.screen.blit(explosion_image, car.position * ppu - ((explosion_image.get_rect().width / 2),(explosion_image.get_rect().height / 2)))
+            self.screen.blit(rotated, car.position * ppu - ((rect.width / 2), (rect.height / 2))) #draw car
             
             # draw dotted lines between car and closest target
             if len(visible_targets) > 0 and car.auto == True:
@@ -1003,6 +1021,19 @@ class PathPlanning:
                 
                 text_surf = text_font.render(f'Autonomous: {car.auto}', 1, (255, 255, 255))
                 text_pos = [10, 80]
+                self.screen.blit(text_surf, text_pos)
+
+                text_surf = text_font.render(f'True [X, Y, alpha]:'
+                                             f' {[round(car.position.x, 2), round(car.position.y, 2)]}', 1, (255, 255, 255))
+                text_pos = [10, 130]
+                self.screen.blit(text_surf, text_pos)
+                # SLAM pose print
+                # TODO
+                # ADD SLAM landmark prints (maybe with uncertainty radius)
+                if slam:
+                    text_surf = text_font.render(f'Est. [X, Y, alpha]:'
+                                                f' {[round(float(x_state[0]), 2), round(float(x_state[1]), 2)]}', 1, (255, 255, 255))
+                text_pos = [10, 150]
                 self.screen.blit(text_surf, text_pos)
 
                 if track == True:
@@ -1058,6 +1089,10 @@ class PathPlanning:
                 text_surf = text_font.render('Press D to load map', 1, (155, 155, 155))
                 text_pos = [10, 660]
                 self.screen.blit(text_surf, text_pos)
+
+                text_surf = text_font.render('Press E to start SLAM', 1, (155, 155, 155))
+                text_pos = [10, 700]
+                self.screen.blit(text_surf, text_pos)
             else:
                 text_surf = text_font.render('Press F to exit Fullscreen', 1, (80, 80, 80))
                 text_pos = [10, 690]
@@ -1073,9 +1108,20 @@ class PathPlanning:
 
 
 if __name__ == '__main__':
+
+    # EKF state covariance
+    # Cx = np.diag([0.5, 0.5, np.deg2rad(30.0)]) ** 2
+    #
+    # #  Simulation parameter
+    # Q_sim = np.diag([0.2, np.deg2rad(1.0)]) ** 2
+    # R_sim = np.diag([1.0, np.deg2rad(10.0)]) ** 2
+    #
+    # MAX_RANGE = 60.0  # maximum observation range
+    # M_DIST_TH = 2.0  # Threshold of Mahalanobis distance for data association.
+    # STATE_SIZE = 3  # State size [x,y,yaw]
+    # LM_SIZE = 2  # LM state size [x,y]
+
+    show_animation = True
+
     sim = PathPlanning()
     sim.run()
-    
-
-    
-    

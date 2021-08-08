@@ -9,26 +9,35 @@
 import serial
 import serial.tools.list_ports
 import time
-import mapClassTemp as mp
 import numpy as np
 
+from Map import Map
+import generalFunctions as GF #(homemade) some useful functions for everyday ease of use
+
 class carMCU:
+    """a class for handling the serial connection to the real car"""
     def __init__(self, connectAtInit=True, comPort=None, autoFind=True):
         self.carMCUserial = serial.Serial()
         self.carMCUserial.baudrate = 115200
         self.carMCUserial.timeout = 0.01 #a 10ms timeout (should only be needed for readline(), which i don't use)
+        self.carMCUserial.rts = False
+        self.carMCUserial.dtr = False
         #carMCUserial.port = comPort #already done in connect()
         self.oldComPortList = [entry.name for entry in serial.tools.list_ports.comports()] #not super clean, but makes debugging easier for now
         if(connectAtInit):
             self.connect(comPort, autoFind) #attempt to connect upon class creation
         
+        self.maxSteeringAngle = np.deg2rad(25) #maybe this should be Map.Car?
+        
         # constants
         self.minimumSerialLength = 14 #the minimum length of a feedback message is "x.xx x.xx x.x\r"
         self.unfinTimeout = 0.015 #if the unfinished message is older than this, just dump it (this value should be larger than the time between getFeedback() calls
+        self.sendMinInterval = 0.09 #minimum time between sending things (to avoid spamming the poor carMCU)
         self.defaultGetFeedbackInterval = 0.005 #used in runOnThread()
         # variables
-        self.unfinString = ''
-        self.unfinTimestamp = time.time()
+        self.unfinString = '' #data may come in unfinished, store that unfinished data here (untill the rest is found)
+        self.unfinTimestamp = time.time() #a timestamp to remember how old the last unfinished message is (if it's too old, discard it)
+        self.lastSendTime = time.time() #timestamp of last sendSpeedAngle() (attempt)
         
         # sensor feedback data in First In First Out buffers, entry [0] is the newest, entry[len()-1] is the oldest
         self.maxFIFOlength = 10 #can safely be changed at runtime (excess FIFO entries will be removed at next write-oppertunity (once the next datapoint comes in))
@@ -39,6 +48,7 @@ class carMCU:
         self.distTotalFIFO = [0]; #total sum of all distance feedbacks
     
     def _autoFindComPort(self):
+        """attempt to find a new/singular COM-port (unplugging and replugging the serial device will make this function return that device)"""
         comPortList = [entry.name for entry in serial.tools.list_ports.comports()]
         print("autoFinding comPorts...")
         if(len(comPortList) < 1):
@@ -77,6 +87,7 @@ class carMCU:
                 return(None, False)
     
     def _comportCheck(self, comPort, autoFind):
+        """check whether or not a given COM-port name exists in the list of COM-ports (may cause issues in linux)"""
         comPortList = [entry.name for entry in serial.tools.list_ports.comports()]
         if(comPort is None):
             print("no carMCU comPort specified")
@@ -89,6 +100,9 @@ class carMCU:
             if(comPort in comPortList):
                 self.oldComPortList = comPortList
                 return(comPort, True)
+            elif((comPort.lstrip('/dev/') in comPortList) if comPort.startswith('/dev/') else False): #quick 'n dirty linux fix
+                self.oldComPortList = comPortList
+                return(comPort, True)
             else:
                 print("bad comPort entered:", comPort)
                 if(autoFind):
@@ -99,6 +113,7 @@ class carMCU:
                 
     
     def connect(self, comPort=None, autoFind=True, replaceIfConnected=False):
+        """connect to a given (or an automatically found) COM-port, or replace an active connection with a new one"""
         if(self.carMCUserial.is_open):
             if(replaceIfConnected):
                 if(not self.disconnect()):
@@ -112,11 +127,13 @@ class carMCU:
             self.carMCUserial.port = comPort
             try:
                 self.carMCUserial.open()
-            except:
+            except Exception as excep:
                 print("couldn't open comPort with port:", self.carMCUserial.port)
+                print("reason:", excep)
         return(self.carMCUserial.is_open)
     
     def disconnect(self):
+        """disconnect from the current COM-port (if connected)"""
         if(self.carMCUserial.is_open):
             try:
                 self.carMCUserial.close()
@@ -127,23 +144,36 @@ class carMCU:
             print("carMCU serial already closed")
         return(True)
     
-    def sendSpeedAngle(self, speed, angle): #TBD: angle unit (radian/degree) conversion, depending on which ones we choose to use
-        if(self.carMCUserial.is_open):
-            dataString = str(round(float(speed), 2)) + ' ' + str(round(float(angle), 1)) + '\n' #convert floats to string ('\r' is not really needed)
-            #print("sending:",dataString.encode())
-            try:
-                self.carMCUserial.write(dataString.encode())
-            except:
-                print("carMCU serial write exception (or encode() exception)")
+    def sendSpeedAngle(self, speed, angle): #NOTE: 'angle' input for this function should be in radians
+        """send a speed and steering angle to the carMCU"""
+        rightNow = time.time()
+        if(abs(angle) > self.maxSteeringAngle): #an extra little check
+            print("can't sendSpeedAngle, steering angle too large:", np.rad2deg(angle))
         else:
-            print("can't sendSpeedAngle(), carMCU is not connected")
+            if((rightNow - self.lastSendTime) > self.sendMinInterval):
+                self.lastSendTime = rightNow
+                if(self.carMCUserial.is_open):
+                    #convert floats to string ('\r' is not really needed)
+                    dataString = str(round(float(speed), 2)) + ' ' + str(round(np.rad2deg(float(angle)), 1)) + '\n'
+                    #NOTE: the (current) serial formatting uses angles in degrees (for more precision per char (unless you start multiplying&dividing by powers of 10))
+                    #print("sending:",dataString.encode())
+                    try:
+                        self.carMCUserial.write(dataString.encode())
+                    except:
+                        print("carMCU serial write exception (or encode() exception)")
+                else:
+                    print("can't sendSpeedAngle(), carMCU is not connected")
+            else:
+                print("you're spamming sendSpeedAngle(), stop it")
     
     def _FIFOwrite(self, value, fifoList, fifoMaxLength):
+        """append a value to a FIFO array and delete the oldest value if needed"""
         fifoList.insert(0, value) #insert the new value at the start of the list
         while(len(fifoList) > fifoMaxLength): #(if) FIFO too long
             fifoList.pop(len(fifoList)-1) #delete the tail entry of the list
     
     def _parseSensorString(self, stringToParse):
+        """parse (decode) a string of sensor feedback from the carMCU"""
         #print("parsing string:", stringToParse.encode())
         splitString = stringToParse.split(' ')
         if(len(splitString) != 3):
@@ -152,12 +182,13 @@ class carMCU:
         self._FIFOwrite(time.time(), self.feedbackTimestampFIFO, self.maxFIFOlength)
         self._FIFOwrite(float(splitString[0]), self.speedFIFO, self.maxFIFOlength)
         self._FIFOwrite(float(splitString[1]), self.distFIFO, self.maxFIFOlength)
-        self._FIFOwrite(float(splitString[2]), self.angleFIFO, self.maxFIFOlength)
+        self._FIFOwrite(np.deg2rad(float(splitString[2])), self.angleFIFO, self.maxFIFOlength)
         self._FIFOwrite(self.distTotalFIFO[0]+self.distFIFO[0], self.distTotalFIFO, self.maxFIFOlength)
         #print(self.speedFIFO[0], self.distFIFO[0], self.angleFIFO[0])
         return(True)
     
     def getFeedback(self): #run this function regularly
+        """(run this function regularly) read serial data (sensor feedback) and parse if possible"""
         if(self.carMCUserial.is_open):
             if(self.carMCUserial.in_waiting > 0):
                 debugVar = self.carMCUserial.in_waiting
@@ -224,6 +255,7 @@ class carMCU:
             return(False)
     
     def runOnThread(self, autoreconnect=False):
+        """(run this on a thread) runs getFeedback() forever and handles exceptions (supports hotplugging serial devices)"""
         carMCUconThreadkeepRunning = True
         while(carMCUconThreadkeepRunning): #super robust, might cause CPU overload though
             try:
@@ -255,14 +287,17 @@ class carMCU:
 
 
 #a TEMPORARY class, to be replaced by SLAM code (which uses real filtering and stuff)
-class realCar(carMCU, mp.Map.Car):
-    def __init__(self, pos=[5,11], angle=0, connectAtInit=True, comPort=None, autoFind=True):
-        mp.Map.Car.__init__(self, pos[0], pos[1], angle)
+class realCar(carMCU, Map.Car):
+    """ a TEMPORARY class that uses carMCU sensor feedback to get car state (position, velocity, etc.)
+        (overwrites Map.Car.update() and carMCU.runOnThread()) """
+    def __init__(self, pos=[0,0], angle=0, connectAtInit=True, comPort=None, autoFind=True):
+        Map.Car.__init__(self, pos, angle)
         carMCU.__init__(self, connectAtInit, comPort, autoFind)
         self.timeSinceLastUpdate = time.time()
         self.skippedUpdateCheckVar = 0.0
     
-    def update(self): #this update() overwrites the update() in Map.Car, but this has no dt argument (because why would you do that)
+    def update(self, inputDt=0): #this update() overwrites the update() in Map.Car, but this doesnt use the dt argument (because timestamps from the FIFO are used)
+        """(overwrites Map.Car.update()) update state (position, velocity, etc.) based ONLY on car sensor feedback"""
         if((len(self.speedFIFO) > 0) and (self.feedbackTimestampFIFO[0] > self.timeSinceLastUpdate)): #if the newest entry ([0]) is newer than the last processed entry
             updates = 0 #ideally, you'd only be dealing with a single new datapoint
             for i in range(len(self.speedFIFO)):
@@ -273,46 +308,67 @@ class realCar(carMCU, mp.Map.Car):
                 if(len(self.speedFIFO) > 1): #dont report error if the program only just started, or if maxFIFOlength is only 1
                     print("!!! updateOverflow !!!:", updates)
                 updates -= 1 #updates is equal to the length of the array, which is not a valid index (and doing -1 is the whole point of the overflow exception)
-                dt = self.timeSinceLastUpdate-self.feedbackTimestampFIFO[updates] #old timestamp - new timestamp
+                dt = self.feedbackTimestampFIFO[updates]-self.timeSinceLastUpdate #old timestamp - new timestamp
                 stepVelocity = (self.velocity + self.speedFIFO[updates])/2
                 stepSteering = (self.steering + self.angleFIFO[updates])/2
                 stepDist = self.distTotalFIFO[updates] - self.skippedUpdateCheckVar #little tricky, but should work
                 
-                angularVelocity = 0 #init var
-                if(abs(stepSteering) > 0.001): #avoid divide by 0
-                    turningRadius = self.length / np.sin(stepSteering)
-                    angularVelocity = stepVelocity / turningRadius #(rework math for rotation around actual point of rotation?)
-                self.angle += (dt * angularVelocity) / 2 #half now...
-                self.position[0] += stepDist * np.cos(self.angle) #x
-                self.position[1] += stepDist * np.sin(self.angle) #y
-                self.angle += (dt * angularVelocity) / 2 #second half of angle change is added after linear movement is calulated, to (hopefully) increase accuracy slightly
+                #turning math
+                if((abs(stepSteering) > 0.001) and (abs(stepVelocity) > 0.001)): #avoid divide by 0 (and avoid complicated math in a simple situation)
+                    rearAxlePos = GF.distAnglePosToPos(self.wheelbase/2, GF.radInv(self.angle), self.position)
+                    turning_radius = self.wheelbase/np.tan(stepSteering)
+                    angular_velocity = self.velocity/turning_radius
+                    arcMov = angular_velocity * dt
+                    #one way to do it
+                    turning_center = GF.distAnglePosToPos(turning_radius, self.angle+(np.pi/2), rearAxlePos) #get point around which car turns
+                    rearAxlePos = GF.distAnglePosToPos(turning_radius, self.angle+arcMov-(np.pi/2), turning_center)      #the car has traveled a a certain distancec (velocity*dt) along the circumference of the turning circle, that arc is arcMov radians long
+                    #update position
+                    self.angle += arcMov
+                    self.position = GF.distAnglePosToPos(self.wheelbase/2, self.angle, rearAxlePos)
+                else:
+                    self.position[0] += dt * stepVelocity * np.cos(self.angle)
+                    self.position[1] += dt * stepVelocity * np.sin(self.angle)
+                    # self.position[0] += stepDist * np.cos(self.angle)
+                    # self.position[1] += stepDist * np.sin(self.angle)
                 self.skippedUpdateCheckVar += stepDist
             #regular forloop to get through
             for i in range(updates):
-                dt = self.feedbackTimestampFIFO[updates-i]-self.feedbackTimestampFIFO[updates-i-1] #old timestamp - new timestamp
-                stepVelocity = (self.speedFIFO[updates-i]+self.speedFIFO[updates-i-1])/2 #idk, average speed between datapoints i guess
-                stepSteering = (self.angleFIFO[updates-i]+self.angleFIFO[updates-i-1])/2 #idk, average steering angle between datapoints i guess
+                dt = self.feedbackTimestampFIFO[updates-i-1]-self.feedbackTimestampFIFO[updates-i] #old timestamp - new timestamp
+                stepVelocity = (self.speedFIFO[updates-i-1]+self.speedFIFO[updates-i])/2 #idk, average speed between datapoints i guess
+                stepSteering = (self.angleFIFO[updates-i-1]+self.angleFIFO[updates-i])/2 #idk, average steering angle between datapoints i guess
                 stepDist = self.distFIFO[updates-i-1] #distance traveled (wheel encoder difference)
                 
-                angularVelocity = 0 #init var
-                if(abs(stepSteering) > 0.001): #avoid divide by 0
-                    turningRadius = self.length / np.sin(stepSteering)
-                    angularVelocity = stepVelocity / turningRadius #(rework math for rotation around actual point of rotation?)
-                self.angle += (dt * angularVelocity) / 2 #half now...
-                self.position[0] += stepDist * np.cos(self.angle) #x
-                self.position[1] += stepDist * np.sin(self.angle) #y
-                self.angle += (dt * angularVelocity) / 2 #second half of angle change is added after linear movement is calulated, to (hopefully) increase accuracy slightly
+                #turning math
+                if((abs(stepSteering) > 0.001) and (abs(stepVelocity) > 0.001)): #avoid divide by 0 (and avoid complicated math in a simple situation)
+                    rearAxlePos = GF.distAnglePosToPos(self.wheelbase/2, GF.radInv(self.angle), self.position)
+                    turning_radius = self.wheelbase/np.tan(stepSteering)
+                    angular_velocity = stepVelocity/turning_radius
+                    arcMov = angular_velocity * dt
+                    #one way to do it
+                    turning_center = GF.distAnglePosToPos(turning_radius, self.angle+(np.pi/2), rearAxlePos) #get point around which car turns
+                    rearAxlePos = GF.distAnglePosToPos(turning_radius, self.angle+arcMov-(np.pi/2), turning_center)      #the car has traveled a a certain distancec (velocity*dt) along the circumference of the turning circle, that arc is arcMov radians long
+                    #update position
+                    self.angle += arcMov
+                    self.position = GF.distAnglePosToPos(self.wheelbase/2, self.angle, rearAxlePos)
+                else:
+                    self.position[0] += dt * stepVelocity * np.cos(self.angle)
+                    self.position[1] += dt * stepVelocity * np.sin(self.angle)
+                    # self.position[0] += stepDist * np.cos(self.angle)
+                    # self.position[1] += stepDist * np.sin(self.angle)
                 self.skippedUpdateCheckVar += stepDist
                 if(abs(self.skippedUpdateCheckVar - self.distTotalFIFO[updates-i-1]) > 0.1): #both variables hold the total (summed up) distance traveled
                     print("you should run car.update() more often, because you are missing important data")
                     print("traveled dist (car.update()):", self.skippedUpdateCheckVar)
                     print("traveled dist (distTotalFIFO["+str(updates-i-1)+"]):", self.distTotalFIFO[updates-i-1])
                     self.skippedUpdateCheckVar = self.distTotalFIFO[updates-i-1]
-            self.velocity = self.speedFIFO[0] #just take the most recent velocity
+            #self.velocity = self.speedFIFO[0] #just take the most recent velocity
+            self.velocity = stepVelocity
+            self.steering = stepSteering
             self.timeSinceLastUpdate = self.feedbackTimestampFIFO[0]
-            #print([round(self.position[0], 2), round(self.position[1], 2)], round(self.angle,2), round(self.velocity,2), round(self.skippedUpdateCheckVar,2))
+            #print([round(self.position[0], 2), round(self.position[1], 2)], round(GF.radRoll(self.angle),2), round(self.velocity,2), round(self.skippedUpdateCheckVar,2))
     
     def runOnThread(self, autoreconnect=False): #overwrites runOnThread() in carMCU class
+        """(run this on a thread) runs getFeedback() and update() forever and handles exceptions (supports hotplugging serial devices)"""
         carMCUconThreadkeepRunning = True
         while(carMCUconThreadkeepRunning): #super robust, might cause CPU overload though
             try:
@@ -322,8 +378,8 @@ class realCar(carMCU, mp.Map.Car):
                     if(not self.carMCUserial.is_open):
                         time.sleep(0.5) #wait a bit between connection attempts
                 while(self.carMCUserial.is_open):
-                    self.getFeedback() #run this to get the data
-                    self.update()
+                    self.getFeedback() #get serial data and parse into values for the fifos
+                    self.update()      #parse fifos to get position
                     time.sleep(self.defaultGetFeedbackInterval) #wait just a little bit, as to not needlessly overload the CPU
                 if(not autoreconnect):
                     print("carMCU connection on thread stopped becuase is_open:", self.carMCUserial.is_open)
@@ -344,6 +400,7 @@ class realCar(carMCU, mp.Map.Car):
                 return()
 
 
-## testing code, turn on a print() inside a function of interest (like car.update()) to see it working
-# someCar = realCar(comPort='COM5')
-# someCar.runOnThread()
+# testing code, turn on a print() inside a function of interest (like car.update()) to see it working
+if __name__ == '__main__':
+    someCar = realCar(comPort='COM8')
+    someCar.runOnThread()
